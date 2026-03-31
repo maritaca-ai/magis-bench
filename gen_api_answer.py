@@ -1,0 +1,182 @@
+"""Generate answers with API models
+
+Usage:
+python3 gen_api_answer.py --model gpt-3.5-turbo
+"""
+import argparse
+import json
+import os
+import time
+import concurrent.futures
+
+import shortuuid
+import tqdm
+from openai import OpenAI
+
+from common import (
+    load_questions,
+    temperature_config,
+    chat_completion_openai,
+)
+from conversation import get_conv_template as get_conversation_template
+
+
+def get_answer(
+    question: dict, model: str, num_choices: int, max_tokens: int, reasoning_effort: str, answer_file: str,
+    api_base: str = None, api_key: str = None, client=None,
+):
+    assert (
+        args.force_temperature is not None and "required_temperature" in question.keys()
+    ) == False
+    if args.force_temperature is not None:
+        temperature = args.force_temperature
+    elif "required_temperature" in question.keys():
+        temperature = question["required_temperature"]
+    elif question["category"] in temperature_config:
+        temperature = temperature_config[question["category"]]
+    else:
+        temperature = 0.7
+
+    choices = []
+    for i in range(num_choices):
+        conv = get_conversation_template("chatgpt")
+
+        # Set system message if the question has it
+        if "system" in question:
+            conv.set_system_message(question["system"])
+
+        turns = []
+        for j in range(len(question["turns"])):
+            conv.append_message(conv.roles[0], question["turns"][j])
+            conv.append_message(conv.roles[1], None)
+
+            api_dict = {}
+            if api_key is not None:
+                api_dict["api_key"] = api_key
+            if api_base is not None:
+                api_dict["api_base"] = api_base
+
+            content, usage = chat_completion_openai(model, conv, temperature, max_tokens, api_dict, client, reasoning_effort)
+            conv.update_last_message(content)
+            turns.append({"content": content, "usage": usage})
+
+        choices.append({"index": i, "turns": turns})
+
+    # Dump answers
+    ans = {
+        "question_id": question["question_id"],
+        "answer_id": shortuuid.uuid(),
+        "model_id": args.run_id,
+        "choices": choices,
+        "tstamp": time.time(),
+    }
+
+    os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+    with open(answer_file, "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(ans, ensure_ascii=False) + "\n")
+
+
+def reorg_answer_file(answer_file):
+    """Sort by question id and de-duplication"""
+    answers = {}
+    with open(answer_file, "r") as fin:
+        for l in fin:
+            qid = json.loads(l)["question_id"]
+            answers[qid] = l
+
+    qids = sorted(list(answers.keys()))
+    with open(answer_file, "w") as fout:
+        for qid in qids:
+            fout.write(answers[qid])
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--bench-name",
+        type=str,
+        default="magis_bench",
+        help="The name of the benchmark question set.",
+    )
+    parser.add_argument("--answer-file", type=str, help="The output answer file.")
+    parser.add_argument("--run-id", type=str, required=True, help="Run ID used for output files and model identification.")
+    parser.add_argument("--model", type=str, default="gpt-3.5-turbo")
+    parser.add_argument(
+        "--num-choices",
+        type=int,
+        default=1,
+        help="How many completion choices to generate.",
+    )
+    parser.add_argument(
+        "--force-temperature", type=float, help="Forcibly set a sampling temperature."
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="The maximum number of new generated tokens.",
+    )
+    parser.add_argument(
+        "--question-begin",
+        type=int,
+        help="A debug option. The begin index of questions.",
+    )
+    parser.add_argument(
+        "--question-end", type=int, help="A debug option. The end index of questions."
+    )
+    parser.add_argument(
+        "--parallel", type=int, default=1, help="The number of concurrent API calls."
+    )
+    parser.add_argument("--api-base", type=str, default="https://openrouter.ai/api/v1")
+    parser.add_argument("--api-key", type=str, default=None)
+    parser.add_argument(
+        "--reasoning_effort",
+        type=str,
+        default=None,
+        choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+        help="Optional reasoning effort level for the model",
+    )
+    args = parser.parse_args()
+
+    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
+    openai_client = OpenAI(api_key=api_key, base_url=args.api_base)
+
+    question_file = f"data/{args.bench_name}/question.jsonl"
+    questions = load_questions(question_file, args.question_begin, args.question_end)
+
+    # Exams: if the question has a statement, add it as a prefix in the first turn
+    for q in questions:
+        if 'statement' in q:
+            q['turns'][0] = q['statement'] + '\n' + q['turns'][0]
+        if 'rows' in q:
+            q['turns'][0] += f"\n\nMáximo de {q['rows']} linhas."
+
+    if args.answer_file:
+        answer_file = args.answer_file
+    else:
+        answer_file = f"data/{args.bench_name}/model_answer/{args.run_id}.jsonl"
+    print(f"Output to {answer_file}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        futures = []
+        for question in questions:
+            future = executor.submit(
+                get_answer,
+                question,
+                args.model,
+                args.num_choices,
+                args.max_tokens,
+                args.reasoning_effort,
+                answer_file,
+                args.api_base,
+                args.api_key,
+                openai_client,
+            )
+            futures.append(future)
+
+        for future in tqdm.tqdm(
+            concurrent.futures.as_completed(futures), total=len(futures)
+        ):
+            future.result()
+
+    reorg_answer_file(answer_file)
