@@ -605,7 +605,13 @@ def chat_completion_openai_structured(model, conv, temperature, max_tokens, resp
             if reasoning_effort is not None:
                 common_args["reasoning_effort"] = reasoning_effort
 
-            response = client.beta.chat.completions.parse(**common_args)
+            try:
+                response = client.beta.chat.completions.parse(**common_args)
+            except TypeError:
+                # OpenRouter may return choices=None, causing parse() to fail
+                print(f"[Retry] beta.parse() returned None choices, retrying...")
+                time.sleep(API_RETRY_SLEEP)
+                continue
 
             usage_info = response.usage
             if usage_info is not None and hasattr(usage_info, "model_dump"):
@@ -613,8 +619,22 @@ def chat_completion_openai_structured(model, conv, temperature, max_tokens, resp
             elif usage_info is not None and not isinstance(usage_info, dict):
                 usage_info = dict(usage_info)
 
+            if response.choices is None:
+                print(f"[Retry] Response choices is None, retrying...")
+                time.sleep(API_RETRY_SLEEP)
+                continue
+
             parsed = response.choices[0].message.parsed
             content = response.choices[0].message.content
+            if parsed is None and content:
+                # Fallback: try to parse content as JSON manually
+                import json as _json
+                try:
+                    parsed = response_format.model_validate_json(content)
+                except Exception:
+                    print(f"[Retry] Failed to parse structured output, retrying...")
+                    time.sleep(API_RETRY_SLEEP)
+                    continue
             return parsed, content, usage_info
         except openai.OpenAIError as e:
             print(type(e), e)
