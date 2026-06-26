@@ -572,6 +572,12 @@ def chat_completion_openai(model, conv, temperature, max_tokens, api_dict=None, 
             else:
                 response = client.chat.completions.create(**common_args, max_completion_tokens=max_tokens)
 
+            if not response.choices:
+                # OpenRouter may return choices=None on transient upstream errors
+                print(f"[Retry] Response choices is None/empty, retrying...")
+                time.sleep(API_RETRY_SLEEP)
+                continue
+
             usage_info = response.usage
             if usage_info is not None and hasattr(usage_info, "model_dump"):
                 usage_info = usage_info.model_dump()
